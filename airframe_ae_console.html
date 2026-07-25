@@ -40,7 +40,8 @@ button,select,input{font:inherit;color:inherit}
 :focus-visible{outline:2px solid var(--a3);outline-offset:2px}
 
 /* ---------- shell ---------- */
-.shell{display:flex;flex-direction:column;min-height:100vh}
+/* Pin to the viewport so the footer stays put; inner regions scroll instead. */
+.shell{display:flex;flex-direction:column;height:100vh;overflow:hidden}
 
 /* ---------- header ---------- */
 header{
@@ -71,7 +72,9 @@ header{
 
 /* ---------- body grid ---------- */
 .grid{display:grid;grid-template-columns:286px minmax(0,1fr) 330px;flex:1;min-height:0}
-.col{border-right:1px solid var(--rule);background:var(--panel);display:flex;flex-direction:column;min-width:0}
+/* min-height:0 lets the column shrink inside the grid row so its inner
+   scroll areas (event log, event detail) bound themselves to the viewport. */
+.col{border-right:1px solid var(--rule);background:var(--panel);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden auto}
 .col:last-child{border-right:0}
 .center{background:var(--void);position:relative;min-width:0}
 
@@ -200,9 +203,11 @@ footer{
 .legend i{width:9px;height:9px;display:block}
 
 @media (max-width:1080px){
+  /* Stacked layout: let the whole page scroll again instead of pinning height. */
+  .shell{height:auto;overflow:visible}
   .grid{grid-template-columns:1fr;grid-template-rows:auto auto auto}
   .center{order:-1;min-height:440px;border-bottom:1px solid var(--rule)}
-  .col{border-right:0;border-bottom:1px solid var(--rule)}
+  .col{border-right:0;border-bottom:1px solid var(--rule);overflow:visible}
   .logwrap{max-height:190px}
 }
 @media (prefers-reduced-motion:reduce){
