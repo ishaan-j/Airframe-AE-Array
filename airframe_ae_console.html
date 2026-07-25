@@ -442,6 +442,17 @@ function makeWingPanel(id,label,quad,side){
 PANELS.wingR = makeWingPanel("wingR","RH wing box",WING_R,"R");
 PANELS.wingL = makeWingPanel("wingL","LH wing box",WING_L,"L");
 
+// Wing/body junction points (root-chord midpoints). A stress wave couples
+// across these joints, so an event on one panel is also heard by sensors on the
+// neighbouring panel near the joint. Path length is source->joint->node.
+const WING_JOINT = {
+  wingR: new THREE.Vector3().addVectors(WING_R.rLE, WING_R.rTE).multiplyScalar(0.5),
+  wingL: new THREE.Vector3().addVectors(WING_L.rLE, WING_L.rTE).multiplyScalar(0.5)
+};
+const JOINT_LOSS = 4;      // extra dB attenuation crossing the structural discontinuity
+const COUPLE_REACH = 3.0;  // world units: cap on the source->joint->node path so only
+                           // sensors genuinely near the joint couple (not the whole airframe)
+
 /* --- node roster ------------------------------------------------- */
 const RINGS = 7, AROUND = 8, WROWS = 3, WCOLS = 3;
 const nodes = [];   // {i,panel,a,b,pos,id,zone}
@@ -670,7 +681,11 @@ function slab(q, th, axis){
   const g=new THREE.BufferGeometry();
   g.setAttribute("position",new THREE.Float32BufferAttribute(pos,3));
   g.setIndex(idx); g.computeVertexNormals();
-  return new THREE.Mesh(g,new THREE.MeshLambertMaterial({color:C.skin}));
+  // DoubleSide: WING_L / HS_L are mirrored (z-negated), which reverses their
+  // winding and turns the box inside-out. Front-face culling would then make
+  // the underside vanish and reveal the top-mounted nodes from below. Rendering
+  // both faces keeps every slab solid regardless of winding.
+  return new THREE.Mesh(g,new THREE.MeshLambertMaterial({color:C.skin,side:THREE.DoubleSide}));
 }
 air.add(slab(WING_R,0.055,"y"), slab(WING_L,0.055,"y"));
 air.add(slab(HS_R,0.04,"y"), slab(HS_L,0.04,"y"), slab(FIN,0.055,"z"));
@@ -874,6 +889,29 @@ function makeEvent(){
   if(hits.length<3) return null;
   const used=hits.slice(0,Math.min(8,hits.length));
 
+  // Cross-panel responders: the wave carries across the wing/body joint, so
+  // sensors on the adjacent structure near the joint also register the hit.
+  // They light up for situational awareness but are NOT fed to the TDOA solve,
+  // whose geodesic metric is only valid within a single panel.
+  const srcPos = panel.point(a,b,0);
+  const responders=[];
+  const couple=(targetPanel,joint)=>{
+    const legIn = srcPos.distanceTo(joint);         // source -> joint (world units)
+    nodes.forEach(n=>{
+      if(n.panel!==targetPanel) return;
+      const path = legIn + joint.distanceTo(n.pos); // source -> joint -> node (world units)
+      if(path > COUPLE_REACH) return;               // only sensors near the joint respond
+      const d = path*MPU;                           // metres
+      const amp = A0 - ATTEN*d - JOINT_LOSS + gauss(rnd)*1.4;
+      if(amp<thresholdDb) return;
+      const t = d/waveV + gauss(rnd)*jitter*1e-6;
+      responders.push({n:n.i,d,amp,t});
+    });
+  };
+  if(panel===PANELS.barrel){ couple(PANELS.wingR,WING_JOINT.wingR); couple(PANELS.wingL,WING_JOINT.wingL); }
+  else if(panel===PANELS.wingR){ couple(PANELS.barrel,WING_JOINT.wingR); }
+  else if(panel===PANELS.wingL){ couple(PANELS.barrel,WING_JOINT.wingL); }
+
   const fix=solve(panel,used);
   const cell=cellFor(panel,fix.a,fix.b);
   const err=panel.dist(a,b,fix.a,fix.b);
@@ -890,7 +928,7 @@ function makeEvent(){
   evCount++;
   return {
     idx:evCount, id:"AE-"+String(2100+evCount),
-    stamp:new Date(), panel, truth:{a,b}, fix, cell, err, hits:used, allHits:hits,
+    stamp:new Date(), panel, truth:{a,b}, fix, cell, err, hits:used, allHits:hits, responders,
     wave:w, spec:sp, fPeak:fMeas, cls, A0,
     conf: Math.max(0.42, Math.min(0.99, 1 - fix.rms*1e6/60 - err/8))
   };
@@ -920,7 +958,7 @@ function present(ev){
 
   $("evCls").textContent=ev.cls.name;
   $("evCls").style.color = ev.cls.sev===2?"var(--a6)":(ev.cls.sev===1?"var(--a5)":"var(--a4)");
-  $("evConf").textContent="peak "+fmt(ev.fPeak,0)+" kHz · "+ev.allHits.length+" nodes hit · confidence "+fmt(ev.conf*100,0)+"%";
+  $("evConf").textContent="peak "+fmt(ev.fPeak,0)+" kHz · "+(ev.allHits.length+(ev.responders?ev.responders.length:0))+" nodes hit · confidence "+fmt(ev.conf*100,0)+"%";
   const act=$("evAct"); act.textContent=ev.cls.act; act.className="act"+(ev.cls.sev===2?" sev":"");
 
   $("evId").textContent=ev.id+" · "+ev.stamp.toISOString().substr(11,8)+"Z";
@@ -949,7 +987,9 @@ function present(ev){
   $("spMeta").textContent="peak "+fmt(ev.fPeak,0)+" kHz → "+ev.cls.name.toLowerCase();
   drawWave(ev); drawSpec(ev);
 
-  lastHitMap={}; ev.allHits.forEach(h=>lastHitMap[h.n]={amp:h.amp,dt:(h.t-ev.hits[0].t)*1e6});
+  lastHitMap={};
+  ev.allHits.forEach(h=>lastHitMap[h.n]={amp:h.amp,dt:(h.t-ev.hits[0].t)*1e6});
+  (ev.responders||[]).forEach(h=>lastHitMap[h.n]={amp:h.amp,dt:(h.t-ev.hits[0].t)*1e6});
   paintNodes(ev,triNodes);
   paintCell(ev,triNodes);
   $("hOpen").textContent=events.length;
