@@ -12,8 +12,11 @@ the fuselage barrel and runs it through the console's existing TDOA/solve/
 classification physics — the same code path the "Trigger test event" button
 uses, just with a real (not random) source location.
 
-Falls back to MockSerial (cycles canned tap positions) when
-USE_REAL_HARDWARE is False or the Arduino can't be reached.
+MockSerial (canned tap positions) is available as a stand-in for the
+Arduino, but it does NOT run automatically — with no hardware connected,
+the console just sits idle and "Trigger test event" in the browser is
+the way to exercise it. Flip MOCK_AUTOPLAY on below if you want
+MockSerial to cycle through taps on its own instead.
 """
 
 import http.server
@@ -31,7 +34,8 @@ import serial.tools.list_ports
 # CONFIGURATION — update these to match your setup
 # ═══════════════════════════════════════════════════════
 
-USE_REAL_HARDWARE = True  # ← flip to True when Arduino arrives
+USE_REAL_HARDWARE = False  # ← flip to True when Arduino arrives
+MOCK_AUTOPLAY     = False  # ← flip to True to have MockSerial cycle taps on its own
 
 # Measure your actual tray dimensions in cm
 SHEET_WIDTH  = 30.0
@@ -190,7 +194,7 @@ def triangulate_2mic(amplitudes, mic_positions):
 
 _clients = []
 _clients_lock = threading.Lock()
-_live_state = {"live": False}
+_live_state = {"live": False, "autoplay": False}
 
 
 def _sse(event_name, data):
@@ -275,10 +279,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 # ═══════════════════════════════════════════════════════
-# EMBEDDED CONSOLE — airframe_ae_console.html, with one hook added:
-# a "Feed" status cell in the header, and a small liveInject()/tapToBarrel()
-# pair wired to /stream so a real triangulated tap runs through the exact
-# same makeEvent() -> solve() -> present() pipeline as the test-event button.
+# EMBEDDED CONSOLE — airframe_ae_console.html, with hooks added:
+# a "Feed" status cell + "Pick two nodes" hardware-span control in the
+# header/left panel, and tapToSource()/liveInject() wired to /stream so a
+# real triangulated tap runs through the exact same makeEvent() -> solve()
+# -> present() pipeline the "Trigger test event" button already uses.
 # Defined here, before the entry point, since server.serve_forever() below
 # blocks forever — anything after it in the file would never actually run.
 # ═══════════════════════════════════════════════════════
@@ -546,6 +551,10 @@ footer{
         <div class="ctl">
           <label for="noise">Timing jitter <b><span id="noiseV">3.0</span> µs</b></label>
           <input type="range" id="noise" min="0" max="12" step="0.5" value="3">
+        </div>
+        <div class="ctl">
+          <label>Hardware span <b id="spanV">not set &mdash; click two nodes</b></label>
+          <button class="btn" id="btnPickSpan" aria-pressed="false">Pick two nodes</button>
         </div>
       </div>
     </div>
@@ -1081,6 +1090,25 @@ function marker(color,size,ring){
 const srcMark=marker(0xFF3B5C,0.34,true);
 const fixMark=marker(0xE8C34E,0.26,false);
 
+// --- hardware-span marker: the 2 user-picked nodes standing in for
+// wherever the physical mic array actually sits on the airframe
+const HW_SPAN_SEG=6;
+const hwSpanLine=new THREE.Line(
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array((HW_SPAN_SEG+1)*3),3)),
+  new THREE.LineBasicMaterial({color:0xFFFFFF}));
+hwSpanLine.visible=false; air.add(hwSpanLine);
+function drawHwSpanLine(){
+  if(!hwSpan){ hwSpanLine.visible=false; return; }
+  const n1=nodes[hwSpan.n1], n2=nodes[hwSpan.n2];
+  const arr=hwSpanLine.geometry.attributes.position.array;
+  for(let s=0;s<=HW_SPAN_SEG;s++){
+    const p=lerpOnPanel(n1,n2,s/HW_SPAN_SEG,0.05);
+    arr[s*3]=p.x; arr[s*3+1]=p.y; arr[s*3+2]=p.z;
+  }
+  hwSpanLine.geometry.attributes.position.needsUpdate=true;
+  hwSpanLine.visible=true;
+}
+
 /* --- camera control ---------------------------------------------- */
 let camT=-0.75, camP=1.16, camD=27;
 const target=new THREE.Vector3(0,0.1,0);
@@ -1094,8 +1122,12 @@ function applyCam(){
 }
 let dragging=false,px=0,py=0;
 const gl=renderer.domElement;
-gl.addEventListener("pointerdown",e=>{dragging=true;px=e.clientX;py=e.clientY;gl.setPointerCapture(e.pointerId);});
-gl.addEventListener("pointerup",e=>{dragging=false;});
+let downX=0, downY=0;
+gl.addEventListener("pointerdown",e=>{dragging=true;px=e.clientX;py=e.clientY;downX=e.clientX;downY=e.clientY;gl.setPointerCapture(e.pointerId);});
+gl.addEventListener("pointerup",e=>{
+  dragging=false;
+  if(pickMode && Math.hypot(e.clientX-downX,e.clientY-downY)<6) tryPickNode(e);
+});
 gl.addEventListener("pointermove",e=>{
   if(dragging){
     tgtT = camT -= (e.clientX-px)*0.008;
@@ -1150,6 +1182,7 @@ resize(); applyCam();
    6. EVENT SIMULATION
    =================================================================== */
 let lastHitMap={}, current=null, events=[], evCount=0;
+let hwSpan=null, pickMode=false, pickStage=0, pickFirst=-1;
 let anim=null, autoTimer=null;
 
 function makeEvent(forced){
@@ -1303,6 +1336,14 @@ function paintNodes(ev,triNodes){
     m.material.color.setHex(col); m.scale.setScalar(sc);
   });
   if(triNodes.length===3) triNodes.forEach((n,k)=>nodeMeshes[n].material.color.set(TRI_COL[k]));
+  paintHwSpan();
+}
+function paintHwSpan(){
+  if(!hwSpan) return;
+  [hwSpan.n1,hwSpan.n2].forEach(idx=>{
+    nodeMeshes[idx].material.color.setHex(0xFFFFFF);
+    nodeMeshes[idx].scale.setScalar(1.6);
+  });
 }
 function paintCell(ev,triNodes){
   if(triNodes.length!==3){cellFill.visible=false;cellEdge.visible=false;return;}
@@ -1514,25 +1555,67 @@ function inject(){
 }
 $("btnInject").addEventListener("click",inject);
 
-/* --- live feed: real taps from final_demo.py's serial/triangulation --- */
-function tapToBarrel(nx,ny){
-  // nx/ny are normalized [0,1] sheet coordinates from the 2-mic triangulation.
-  // nx runs fwd->aft along the barrel; ny (mic setup can only resolve the
-  // sheet's vertical center today) maps to the fuselage's top/side arc.
-  const P=PANELS.barrel;
-  const a=P.aMin+Math.min(1,Math.max(0,nx))*(P.aMax-P.aMin);
-  const b=wrapPi((Math.min(1,Math.max(0,ny))-0.5)*Math.PI);
-  return {a,b};
+/* --- hardware span: click two nodes to say "this is what the 2-mic
+   sheet is listening to" so real taps land on that segment ---------- */
+function updateSpanLabel(){
+  const el=$("spanV");
+  if(!el) return;
+  if(hwSpan) el.textContent=nodes[hwSpan.n1].id+" ↔ "+nodes[hwSpan.n2].id;
+  else if(pickMode && pickStage===1) el.textContent="click the second node…";
+  else if(pickMode) el.textContent="click the first node…";
+  else el.textContent="not set — click two nodes";
 }
-function liveInject(a,b){
-  let ev=null,guard=0;
-  while(!ev && guard++<12) ev=makeEvent({panel:PANELS.barrel,a,b});
-  if(!ev){
-    $("phase").textContent="Tap below threshold — ignored";
-    $("phase").classList.add("on");
-    setTimeout(()=>$("phase").classList.remove("on"),1500);
+function tryPickNode(e){
+  const r=gl.getBoundingClientRect();
+  mouse.x=((e.clientX-r.left)/r.width)*2-1;
+  mouse.y=-((e.clientY-r.top)/r.height)*2+1;
+  ray.setFromCamera(mouse,camera);
+  const hit=ray.intersectObjects(nodeMeshes,false)[0];
+  if(!hit) return;
+  const idx=hit.object.userData.n.i;
+  if(pickStage===0){
+    pickFirst=idx; pickStage=1; updateSpanLabel();
     return;
   }
+  if(idx===pickFirst) return; // same node twice — keep waiting
+  if(nodes[idx].panel!==nodes[pickFirst].panel){
+    $("phase").textContent="Second node must be on the same panel — try again";
+    $("phase").classList.add("on");
+    setTimeout(()=>$("phase").classList.remove("on"),1800);
+    return;
+  }
+  hwSpan={n1:pickFirst,n2:idx};
+  pickMode=false; pickStage=0;
+  $("btnPickSpan").setAttribute("aria-pressed","false");
+  drawHwSpanLine(); updateSpanLabel();
+  if(!current) renderZones();
+}
+$("btnPickSpan").addEventListener("click",e=>{
+  pickMode=e.currentTarget.getAttribute("aria-pressed")!=="true";
+  e.currentTarget.setAttribute("aria-pressed",pickMode);
+  pickStage=0; pickFirst=-1;
+  updateSpanLabel();
+});
+
+function tapToSource(nx,ny){
+  const u=Math.min(1,Math.max(0,nx));
+  if(hwSpan){
+    const n1=nodes[hwSpan.n1], n2=nodes[hwSpan.n2], panel=n1.panel;
+    const a=n1.a+(n2.a-n1.a)*u;
+    const b=panel.bWrap ? n1.b+wrapPi(n2.b-n1.b)*u : n1.b+(n2.b-n1.b)*u;
+    return {panel,a,b};
+  }
+  // no span picked yet — fall back to a barrel-wide spread so a live tap
+  // still lands somewhere sensible instead of silently doing nothing.
+  const panel=PANELS.barrel;
+  const a=panel.aMin+u*(panel.aMax-panel.aMin);
+  const b=wrapPi((Math.min(1,Math.max(0,ny))-0.5)*Math.PI);
+  return {panel,a,b};
+}
+function liveInject(panel,a,b){
+  let ev=null,guard=0;
+  while(!ev && guard++<12) ev=makeEvent({panel,a,b});
+  if(!ev) return; // real tap too quiet to trip the threshold — ignore
   events.push(ev); if(events.length>24) events.shift();
   present(ev); renderZones();
 }
@@ -1543,12 +1626,14 @@ function setFeed(text,ok){ if(!feedEl) return; feedEl.textContent=text; feedEl.c
   try{ es=new EventSource("/stream"); } catch(err){ setFeed("● OFFLINE",false); return; }
   es.addEventListener("status", e=>{
     const d=JSON.parse(e.data);
-    setFeed(d.live?"● LIVE SERIAL":"● MOCK DATA", d.live);
+    if(d.live) setFeed("● LIVE SERIAL",true);
+    else if(d.autoplay) setFeed("● MOCK (AUTO)",false);
+    else setFeed("● NO FEED — use test button",false);
   });
   es.addEventListener("tap", e=>{
     const d=JSON.parse(e.data);
-    const {a,b}=tapToBarrel(d.nx,d.ny);
-    liveInject(a,b);
+    const {panel,a,b}=tapToSource(d.nx,d.ny);
+    liveInject(panel,a,b);
   });
   es.onerror=()=>setFeed("● NO CONNECTION",false);
 })();
@@ -1591,6 +1676,7 @@ let t=0;
       m.material.color.setHex(k>0.6?C.nodeArm:C.node);
       m.scale.setScalar(1+k*0.35);
     });
+    paintHwSpan();
   }
   renderer.render(scene,camera);
 })();
@@ -1610,6 +1696,7 @@ setTimeout(()=>{ drawRuler(); resize(); },120);
 # ═══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    ser = None
     if USE_REAL_HARDWARE:
         print("Connecting to Arduino...")
         try:
@@ -1618,14 +1705,18 @@ if __name__ == "__main__":
             print("Connected. Streaming live taps to the console...")
         except Exception as e:
             print(f"Connection failed: {e}")
-            print("Falling back to mock data...")
-            ser = MockSerial()
-    else:
-        print("Running with mock data.")
-        print("Set USE_REAL_HARDWARE = True when Arduino arrives.")
-        ser = MockSerial()
+            print("No Arduino connected.")
 
-    threading.Thread(target=serial_loop, args=(ser,), daemon=True).start()
+    if ser is None and MOCK_AUTOPLAY:
+        print("MOCK_AUTOPLAY is on — MockSerial will cycle canned tap positions.")
+        ser = MockSerial()
+        _live_state["autoplay"] = True
+
+    if ser is not None:
+        threading.Thread(target=serial_loop, args=(ser,), daemon=True).start()
+    else:
+        print('No live feed running. Use "Trigger test event" in the console '
+              "to exercise it, or flip USE_REAL_HARDWARE / MOCK_AUTOPLAY above.")
 
     server = http.server.ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     url = f"http://{HTTP_HOST}:{HTTP_PORT}/"
