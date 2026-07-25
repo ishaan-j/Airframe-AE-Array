@@ -590,13 +590,19 @@ function solve(panel, hits){
 }
 // which mesh cell owns the fix? (barycentric in unrolled panel coords)
 function cellFor(panel, a, b){
-  const to2 = (aa,bb)=> panel.bWrap
-      ? [aa*FUSE_LEN*MPU, wrapPi(bb-b)*FUSE_R*MPU]
-      : [aa*(panel.spanLen||1), bb*(panel.chordLen||1)];
-  const P = to2(a,b);
   let bestT=null, bestD=Infinity;
   for(const tr of tris){
     if(tr.panel!==panel) continue;
+    // Unroll azimuth relative to THIS triangle (not the query b). Unrolling
+    // against the query puts the seam at the query's antipode, which stretches
+    // any cell crossing it across the whole barrel — and the query would then
+    // test "inside" that antipodal cell ~half the time, highlighting the wrong
+    // side of the fuselage. A per-cell reference keeps every cell compact.
+    const ref = panel.bWrap ? nodes[tr.v[0]].b : 0;
+    const to2 = panel.bWrap
+        ? (aa,bb)=>[aa*FUSE_LEN*MPU, wrapPi(bb-ref)*FUSE_R*MPU]
+        : (aa,bb)=>[aa*(panel.spanLen||1), bb*(panel.chordLen||1)];
+    const P = to2(a,b);
     const [A,B,C]=tr.v.map(i=>to2(nodes[i].a,nodes[i].b));
     const d=(B[1]-C[1])*(A[0]-C[0])+(C[0]-B[0])*(A[1]-C[1]);
     if(Math.abs(d)<1e-9) continue;
@@ -691,12 +697,12 @@ tris.forEach(tr=>{
     }
   });
 });
-function lerpOnPanel(n1,n2,u){
+function lerpOnPanel(n1,n2,u,off){
   const p=n1.panel;
   if(p!==n2.panel) return new THREE.Vector3().lerpVectors(n1.pos,n2.pos,u);
   const a=n1.a+(n2.a-n1.a)*u;
   const b=p.bWrap ? n1.b+wrapPi(n2.b-n1.b)*u : n1.b+(n2.b-n1.b)*u;
-  return p.point(a,b,0.014);
+  return p.point(a,b,off===undefined?0.014:off);
 }
 const meshEdges=new THREE.LineSegments(
   new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(ePos,3)),
@@ -719,12 +725,16 @@ const nodeMeshes=nodes.map(n=>{
 });
 
 // --- highlighted cell + markers + rings
+// Tessellate the cell so it follows curved panels (barrel) instead of a flat
+// chord that sinks under the fuselage skin. CELL_SUB fill tris per edge,
+// CELL_ESEG outline segments per edge.
+const CELL_SUB=5, CELL_ESEG=6;
 const cellFill=new THREE.Mesh(
-  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array(9),3)),
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array(CELL_SUB*CELL_SUB*9),3)),
   new THREE.MeshBasicMaterial({color:0xE8C34E,transparent:true,opacity:0.20,side:THREE.DoubleSide,depthWrite:false}));
 cellFill.visible=false; air.add(cellFill);
 const cellEdge=new THREE.Line(
-  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array(12),3)),
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array((CELL_ESEG*3+1)*3),3)),
   new THREE.LineBasicMaterial({color:0xE8C34E}));
 cellEdge.visible=false; air.add(cellEdge);
 
@@ -958,12 +968,32 @@ function paintNodes(ev,triNodes){
 }
 function paintCell(ev,triNodes){
   if(triNodes.length!==3){cellFill.visible=false;cellEdge.visible=false;return;}
-  const pts=triNodes.map(i=>{const n=nodes[i];return n.panel.point(n.a,n.b,0.02);});
-  const fa=cellFill.geometry.attributes.position.array;
-  pts.forEach((p,k)=>{fa[k*3]=p.x;fa[k*3+1]=p.y;fa[k*3+2]=p.z;});
+  const na=nodes[triNodes[0]], nb=nodes[triNodes[1]], nc=nodes[triNodes[2]];
+  const P=na.panel;
+  // barycentric (u,v,w) over the three nodes -> curved surface point, so a
+  // barrel cell hugs the skin instead of cutting a flat chord beneath it.
+  const surf=(u,v,off)=>{
+    const w=1-u-v;
+    const a=u*na.a+v*nb.a+w*nc.a;
+    const b=P.bWrap ? na.b + v*wrapPi(nb.b-na.b) + w*wrapPi(nc.b-na.b)
+                    : u*na.b+v*nb.b+w*nc.b;
+    return P.point(a,b,off);
+  };
+  // fill — tessellated triangle following the surface
+  const fa=cellFill.geometry.attributes.position.array; let fi=0;
+  const put=p=>{fa[fi++]=p.x;fa[fi++]=p.y;fa[fi++]=p.z;};
+  const N=CELL_SUB;
+  for(let i=0;i<N;i++) for(let j=0;j<N-i;j++){
+    put(surf(i/N,j/N,0.022)); put(surf((i+1)/N,j/N,0.022)); put(surf(i/N,(j+1)/N,0.022));
+    if(i+j<N-1){ put(surf((i+1)/N,j/N,0.022)); put(surf((i+1)/N,(j+1)/N,0.022)); put(surf(i/N,(j+1)/N,0.022)); }
+  }
   cellFill.geometry.attributes.position.needsUpdate=true;
-  const ea=cellEdge.geometry.attributes.position.array;
-  [...pts,pts[0]].forEach((p,k)=>{ea[k*3]=p.x;ea[k*3+1]=p.y;ea[k*3+2]=p.z;});
+  // outline — each edge subdivided along the surface, then closed
+  const ea=cellEdge.geometry.attributes.position.array; let ei=0;
+  [[na,nb],[nb,nc],[nc,na]].forEach(([p,q])=>{
+    for(let s=0;s<CELL_ESEG;s++){ const pt=lerpOnPanel(p,q,s/CELL_ESEG,0.03); ea[ei++]=pt.x;ea[ei++]=pt.y;ea[ei++]=pt.z; }
+  });
+  ea[ei++]=ea[0]; ea[ei++]=ea[1]; ea[ei++]=ea[2];   // close the loop
   cellEdge.geometry.attributes.position.needsUpdate=true;
   cellFill.visible=true; cellEdge.visible=true;
 }
