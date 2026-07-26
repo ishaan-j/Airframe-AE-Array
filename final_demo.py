@@ -17,6 +17,12 @@ Arduino, but it does NOT run automatically — with no hardware connected,
 the console just sits idle and "Trigger test event" in the browser is
 the way to exercise it. Flip MOCK_AUTOPLAY on below if you want
 MockSerial to cycle through taps on its own instead.
+
+A background watcher polls for a real Arduino every couple seconds and,
+the moment it finds one, switches the live feed over to it — stopping
+whatever mock data was running — with no restart needed. Plugging in the
+Arduino is enough; the console's "Feed" indicator flips to LIVE SERIAL
+on its own.
 """
 
 import http.server
@@ -108,23 +114,30 @@ class MockSerial:
 # SERIAL CONNECTION
 # ═══════════════════════════════════════════════════════
 
-def connect_arduino():
-    """
-    Auto-detects Arduino port.
-    If auto-detect fails, lists available ports and asks you to pick.
-    """
-    ports = list(serial.tools.list_ports.comports())
-
-    for p in ports:
+def find_arduino_port():
+    """Silently look for an Arduino-like serial port. Returns a device path or None."""
+    for p in serial.tools.list_ports.comports():
         desc = p.description.lower()
         dev  = p.device.lower()
         if ("arduino" in desc or
             "ttyacm"  in dev  or
             "ttyusb"  in dev  or
             "usbserial" in dev):
-            print(f"Auto-detected Arduino on {p.device}")
-            return serial.Serial(p.device, SERIAL_BAUD, timeout=0.05)
+            return p.device
+    return None
 
+
+def connect_arduino():
+    """
+    Auto-detects Arduino port.
+    If auto-detect fails, lists available ports and asks you to pick.
+    """
+    port = find_arduino_port()
+    if port:
+        print(f"Auto-detected Arduino on {port}")
+        return serial.Serial(port, SERIAL_BAUD, timeout=0.05)
+
+    ports = list(serial.tools.list_ports.comports())
     print("Could not auto-detect Arduino. Available ports:")
     for i, p in enumerate(ports):
         print(f"  [{i}] {p.device} — {p.description}")
@@ -214,9 +227,9 @@ def broadcast(event_name, data):
             _clients.remove(q)
 
 
-def serial_loop(ser):
+def serial_loop(ser, stop_event):
     """Background thread: poll serial, triangulate, broadcast normalized taps."""
-    while True:
+    while not stop_event.is_set():
         ts, amps = read_tap(ser)
         if ts is not None and amps is not None:
             result = triangulate_2mic(amps, MIC_POSITIONS)
@@ -229,6 +242,41 @@ def serial_loop(ser):
                     "nx": nx, "ny": ny,
                 })
         time.sleep(0.01)
+
+
+_serial_stop = threading.Event()
+
+
+def start_serial(ser):
+    """(Re)start the polling/broadcast thread for `ser`, stopping any previous one."""
+    _serial_stop.set()
+    time.sleep(0.05)  # let the previous thread notice and exit
+    _serial_stop.clear()
+    threading.Thread(target=serial_loop, args=(ser, _serial_stop), daemon=True).start()
+
+
+def hardware_watch_loop():
+    """
+    Background thread: while we're not already on a live Arduino, keep checking
+    for one every couple seconds. The moment it appears, switch the feed over —
+    dropping whatever mock data was running — with no restart required.
+    """
+    while True:
+        if not _live_state["live"]:
+            port = find_arduino_port()
+            if port:
+                try:
+                    new_ser = serial.Serial(port, SERIAL_BAUD, timeout=0.05)
+                except Exception as e:
+                    print(f"Arduino seen on {port} but couldn't open it: {e}")
+                    new_ser = None
+                if new_ser is not None:
+                    print(f"Arduino connected on {port} — switching off mock data.")
+                    _live_state["live"] = True
+                    _live_state["autoplay"] = False
+                    start_serial(new_ser)
+                    broadcast("status", dict(_live_state))
+        time.sleep(2.0)
 
 
 # ═══════════════════════════════════════════════════════
@@ -1076,6 +1124,34 @@ function drawRing(line,panel,a,b,rad){
   line.visible=true;
 }
 
+const FIX_AREA_SEG=40;
+const fixArea=new THREE.Mesh(
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array(FIX_AREA_SEG*3*3),3)),
+  new THREE.MeshBasicMaterial({color:0xE8C34E,transparent:true,opacity:0.32,side:THREE.DoubleSide,depthWrite:false}));
+fixArea.visible=false; air.add(fixArea);
+function drawFixArea(panel,a,b,rad){
+  if(!(rad>0.001)){ fixArea.visible=false; return; }
+  const center=panel.point(a,b,0.028);
+  const ring=[];
+  for(let k=0;k<=FIX_AREA_SEG;k++){
+    const ph=k/FIX_AREA_SEG*Math.PI*2;
+    const [aa,bb]=panel.step(a,b,rad*Math.cos(ph),rad*Math.sin(ph));
+    const A=Math.min(panel.aMax+0.10,Math.max(panel.aMin-0.10,aa));
+    const B=panel.bWrap?bb:Math.min(1.02,Math.max(-0.02,bb));
+    ring.push(panel.point(A,B,0.028));
+  }
+  const arr=fixArea.geometry.attributes.position.array;
+  let i=0;
+  for(let k=0;k<FIX_AREA_SEG;k++){
+    const p1=ring[k], p2=ring[k+1];
+    arr[i++]=center.x; arr[i++]=center.y; arr[i++]=center.z;
+    arr[i++]=p1.x; arr[i++]=p1.y; arr[i++]=p1.z;
+    arr[i++]=p2.x; arr[i++]=p2.y; arr[i++]=p2.z;
+  }
+  fixArea.geometry.attributes.position.needsUpdate=true;
+  fixArea.visible=true;
+}
+
 function marker(color,size,ring){
   const g=new THREE.Group();
   const mat=new THREE.LineBasicMaterial({color});
@@ -1087,8 +1163,8 @@ function marker(color,size,ring){
   }
   g.visible=false; air.add(g); return g;
 }
-const srcMark=marker(0xFF3B5C,0.34,true);
-const fixMark=marker(0xE8C34E,0.26,false);
+const srcMark=marker(0xFF3B5C,0.46,true);   // impact — where the tap actually happened
+const fixMark=marker(0xE8C34E,0.30,false);  // fix — the array's solved estimate
 
 // --- hardware-span marker: the 2 user-picked nodes standing in for
 // wherever the physical mic array actually sits on the airframe
@@ -1324,6 +1400,7 @@ function present(ev){
   $("hState").className="v hot";
   drawRuler();
   renderLog();
+  drawFixArea(ev.panel, ev.fix.a, ev.fix.b, (ev.fix.rms*waveV*1.96)/MPU);
   runAnimation(ev,triNodes);
 }
 
@@ -1677,6 +1754,8 @@ let t=0;
       m.scale.setScalar(1+k*0.35);
     });
     paintHwSpan();
+  } else if(srcMark.visible){
+    srcMark.scale.setScalar(1+0.18*Math.sin(t*4.2));
   }
   renderer.render(scene,camera);
 })();
@@ -1713,10 +1792,14 @@ if __name__ == "__main__":
         _live_state["autoplay"] = True
 
     if ser is not None:
-        threading.Thread(target=serial_loop, args=(ser,), daemon=True).start()
+        start_serial(ser)
     else:
         print('No live feed running. Use "Trigger test event" in the console '
               "to exercise it, or flip USE_REAL_HARDWARE / MOCK_AUTOPLAY above.")
+
+    # Keep watching for the Arduino even if we started on mock/idle — plugging
+    # it in later is enough to take over the live feed, no restart needed.
+    threading.Thread(target=hardware_watch_loop, daemon=True).start()
 
     server = http.server.ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     url = f"http://{HTTP_HOST}:{HTTP_PORT}/"
