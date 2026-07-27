@@ -1,3 +1,341 @@
+"""
+final_demo.py — Airframe AE Array console, driven by real tap data.
+
+Serves the Three.js airframe simulation (airframe_ae_console.html, embedded
+below unmodified except for a live-feed hook) from a small local HTTP server,
+and pushes real acoustic-tap events into it over Server-Sent Events.
+
+Taps come from hardware_code.py's pipeline: read two MAX4466 amplitudes off
+an Arduino's serial port, triangulate a position on the metal sheet, and
+normalize it to [0,1] sheet coordinates. The browser maps that position onto
+the fuselage barrel and runs it through the console's existing TDOA/solve/
+classification physics — the same code path the "Trigger test event" button
+uses, just with a real (not random) source location.
+
+MockSerial (canned tap positions) is available as a stand-in for the
+Arduino, but it does NOT run automatically — with no hardware connected,
+the console just sits idle and "Trigger test event" in the browser is
+the way to exercise it. Flip MOCK_AUTOPLAY on below if you want
+MockSerial to cycle through taps on its own instead.
+
+A background watcher polls for a real Arduino every couple seconds and,
+the moment it finds one, switches the live feed over to it — stopping
+whatever mock data was running — with no restart needed. Plugging in the
+Arduino is enough; the console's "Feed" indicator flips to LIVE SERIAL
+on its own.
+"""
+
+import http.server
+import json
+import queue
+import threading
+import time
+import webbrowser
+
+import numpy as np
+import serial
+import serial.tools.list_ports
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION — update these to match your setup
+# ═══════════════════════════════════════════════════════
+
+USE_REAL_HARDWARE = False  # ← flip to True when Arduino arrives
+MOCK_AUTOPLAY     = False  # ← flip to True to have MockSerial cycle taps on its own
+
+# Measure your actual tray dimensions in cm
+SHEET_WIDTH  = 30.0
+SHEET_HEIGHT = 25.0
+
+# Measure where you physically place mics on tray (cm from bottom-left)
+MIC_POSITIONS = np.array([
+    [3.0,  12.5],   # Mic 1 — left side, middle height
+    [27.0, 12.5],   # Mic 2 — right side, middle height
+])
+
+SERIAL_BAUD = 115200
+HTTP_HOST   = "127.0.0.1"
+HTTP_PORT   = 8765
+
+# ═══════════════════════════════════════════════════════
+# MOCK SERIAL — used when USE_REAL_HARDWARE = False
+# ═══════════════════════════════════════════════════════
+
+class MockSerial:
+    """
+    Simulates Arduino serial output for testing without hardware.
+    Cycles through tap positions across the sheet automatically.
+    """
+    def __init__(self):
+        self.last_event   = time.time()
+        self.sequence_idx = 0
+
+        # Each entry: [amp1, amp2] representing different tap positions
+        # High amp1 = tap near left mic
+        # High amp2 = tap near right mic
+        # Equal     = tap in center
+        self.tap_sequence = [
+            [380, 60],   # far left
+            [280, 120],  # left of center
+            [200, 200],  # center
+            [120, 280],  # right of center
+            [60,  380],  # far right
+            [320, 80],   # left
+            [80,  320],  # right
+        ]
+
+    @property
+    def in_waiting(self):
+        # Computed live (rather than only set as a side effect of readline())
+        # so read_tap()'s "if ser.in_waiting" gate actually opens on schedule.
+        return 1 if (time.time() - self.last_event) > 2.5 else 0
+
+    def readline(self):
+        current_time = time.time()
+        if current_time - self.last_event > 2.5:
+            self.last_event = current_time
+            amps = self.tap_sequence[
+                self.sequence_idx % len(self.tap_sequence)
+            ]
+            self.sequence_idx += 1
+
+            # Add noise to make it realistic
+            amps = [max(0, a + np.random.randint(-25, 25))
+                    for a in amps]
+
+            ts   = int(current_time * 1000)
+            line = f"{ts},{amps[0]},{amps[1]}\n"
+            return line.encode("utf-8")
+
+        return b""
+
+
+# ═══════════════════════════════════════════════════════
+# SERIAL CONNECTION
+# ═══════════════════════════════════════════════════════
+
+def find_arduino_port():
+    """Silently look for an Arduino-like serial port. Returns a device path or None."""
+    for p in serial.tools.list_ports.comports():
+        desc = p.description.lower()
+        dev  = p.device.lower()
+        if ("arduino" in desc or
+            "ttyacm"  in dev  or
+            "ttyusb"  in dev  or
+            "usbserial" in dev):
+            return p.device
+    return None
+
+
+def connect_arduino():
+    """
+    Auto-detects Arduino port.
+    If auto-detect fails, lists available ports and asks you to pick.
+    """
+    port = find_arduino_port()
+    if port:
+        print(f"Auto-detected Arduino on {port}")
+        return serial.Serial(port, SERIAL_BAUD, timeout=0.05)
+
+    ports = list(serial.tools.list_ports.comports())
+    print("Could not auto-detect Arduino. Available ports:")
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device} — {p.description}")
+
+    if not ports:
+        raise Exception("No serial ports found. Check USB connection.")
+
+    idx  = int(input("Enter port number: "))
+    port = ports[idx].device
+    return serial.Serial(port, SERIAL_BAUD, timeout=0.05)
+
+
+# ═══════════════════════════════════════════════════════
+# SIGNAL PROCESSING
+# ═══════════════════════════════════════════════════════
+
+def read_tap(ser):
+    """
+    Read one line from serial.
+    Returns (timestamp, [amp1, amp2]) or (None, None).
+    """
+    try:
+        if ser.in_waiting:
+            raw  = ser.readline()
+            line = raw.decode("utf-8").strip()
+            if "," in line:
+                parts = line.split(",")
+                if len(parts) == 3:
+                    ts   = int(parts[0])
+                    amps = [int(parts[1]), int(parts[2])]
+                    return ts, amps
+    except Exception:
+        pass
+    return None, None
+
+
+def triangulate_2mic(amplitudes, mic_positions):
+    """
+    2-microphone amplitude-based position estimation.
+
+    Physics: sound amplitude falls off with distance.
+    Higher amplitude at mic = tap is closer to that mic.
+    Gives us left-right position reliably.
+    Y is fixed to sheet center (limitation of 2-mic setup).
+
+    For full 2D localization you need 3+ mics.
+    """
+    amp1, amp2 = float(amplitudes[0]), float(amplitudes[1])
+    total = amp1 + amp2
+
+    if total < 1:
+        return None
+
+    w1 = amp1 / total
+    w2 = amp2 / total
+
+    x = w1 * mic_positions[0][0] + w2 * mic_positions[1][0]
+    y = SHEET_HEIGHT / 2  # fixed center — limitation of 2 mics
+
+    x = np.clip(x, 0, SHEET_WIDTH)
+    return float(x), float(y)
+
+
+# ═══════════════════════════════════════════════════════
+# LIVE-FEED BROADCAST (server-sent events -> browser console)
+# ═══════════════════════════════════════════════════════
+
+_clients = []
+_clients_lock = threading.Lock()
+_live_state = {"live": False, "autoplay": False}
+
+
+def _sse(event_name, data):
+    return f"event: {event_name}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+def broadcast(event_name, data):
+    payload = _sse(event_name, data)
+    with _clients_lock:
+        dead = []
+        for q in _clients:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _clients.remove(q)
+
+
+def serial_loop(ser, stop_event):
+    """Background thread: poll serial, triangulate, broadcast normalized taps."""
+    while not stop_event.is_set():
+        ts, amps = read_tap(ser)
+        if ts is not None and amps is not None:
+            result = triangulate_2mic(amps, MIC_POSITIONS)
+            if result:
+                sx, sy = result
+                nx = float(np.clip(sx / SHEET_WIDTH, 0, 1))
+                ny = float(np.clip(sy / SHEET_HEIGHT, 0, 1))
+                broadcast("tap", {
+                    "ts": ts, "amp1": amps[0], "amp2": amps[1],
+                    "nx": nx, "ny": ny,
+                })
+        time.sleep(0.01)
+
+
+_serial_stop = threading.Event()
+
+
+def start_serial(ser):
+    """(Re)start the polling/broadcast thread for `ser`, stopping any previous one."""
+    _serial_stop.set()
+    time.sleep(0.05)  # let the previous thread notice and exit
+    _serial_stop.clear()
+    threading.Thread(target=serial_loop, args=(ser, _serial_stop), daemon=True).start()
+
+
+def hardware_watch_loop():
+    """
+    Background thread: while we're not already on a live Arduino, keep checking
+    for one every couple seconds. The moment it appears, switch the feed over —
+    dropping whatever mock data was running — with no restart required.
+    """
+    while True:
+        if not _live_state["live"]:
+            port = find_arduino_port()
+            if port:
+                try:
+                    new_ser = serial.Serial(port, SERIAL_BAUD, timeout=0.05)
+                except Exception as e:
+                    print(f"Arduino seen on {port} but couldn't open it: {e}")
+                    new_ser = None
+                if new_ser is not None:
+                    print(f"Arduino connected on {port} — switching off mock data.")
+                    _live_state["live"] = True
+                    _live_state["autoplay"] = False
+                    start_serial(new_ser)
+                    broadcast("status", dict(_live_state))
+        time.sleep(2.0)
+
+
+# ═══════════════════════════════════════════════════════
+# HTTP SERVER — serves the console + the /stream SSE feed
+# ═══════════════════════════════════════════════════════
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive, needed for a long-lived /stream
+
+    def log_message(self, fmt, *args):
+        pass  # quiet; serial_loop / main already report status
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            body = CONSOLE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            q = queue.Queue(maxsize=64)
+            with _clients_lock:
+                _clients.append(q)
+            try:
+                self.wfile.write(_sse("status", dict(_live_state)))
+                self.wfile.flush()
+                while True:
+                    try:
+                        payload = q.get(timeout=15)
+                    except queue.Empty:
+                        payload = b": keep-alive\n\n"
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            finally:
+                with _clients_lock:
+                    if q in _clients:
+                        _clients.remove(q)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+# ═══════════════════════════════════════════════════════
+# EMBEDDED CONSOLE — airframe_ae_console.html, with hooks added:
+# a "Feed" status cell + "Pick two nodes" hardware-span control in the
+# header/left panel, and tapToSource()/liveInject() wired to /stream so a
+# real triangulated tap runs through the exact same makeEvent() -> solve()
+# -> present() pipeline the "Trigger test event" button already uses.
+# Defined here, before the entry point, since server.serve_forever() below
+# blocks forever — anything after it in the file would never actually run.
+# ═══════════════════════════════════════════════════════
+CONSOLE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -229,6 +567,7 @@ footer{
     <div class="hcell"><span class="k">Cycles</span><span class="v">18 412</span></div>
     <div class="hcell"><span class="k">Nodes online</span><span class="v ok" id="hNodes">74 / 74</span></div>
     <div class="hcell"><span class="k">State</span><span class="v ok" id="hState"><i class="pulse"></i>Armed</span></div>
+    <div class="hcell"><span class="k">Feed</span><span class="v" id="hFeed">&mdash; connecting &mdash;</span></div>
     <div class="hcell"><span class="k">Open events</span><span class="v" id="hOpen">0</span></div>
   </div>
 </header>
@@ -260,6 +599,10 @@ footer{
         <div class="ctl">
           <label for="noise">Timing jitter <b><span id="noiseV">3.0</span> µs</b></label>
           <input type="range" id="noise" min="0" max="12" step="0.5" value="3">
+        </div>
+        <div class="ctl">
+          <label>Hardware span <b id="spanV">not set &mdash; click two nodes</b></label>
+          <button class="btn" id="btnPickSpan" aria-pressed="false">Pick two nodes</button>
         </div>
       </div>
     </div>
@@ -781,6 +1124,34 @@ function drawRing(line,panel,a,b,rad){
   line.visible=true;
 }
 
+const FIX_AREA_SEG=40;
+const fixArea=new THREE.Mesh(
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array(FIX_AREA_SEG*3*3),3)),
+  new THREE.MeshBasicMaterial({color:0xE8C34E,transparent:true,opacity:0.32,side:THREE.DoubleSide,depthWrite:false}));
+fixArea.visible=false; air.add(fixArea);
+function drawFixArea(panel,a,b,rad){
+  if(!(rad>0.001)){ fixArea.visible=false; return; }
+  const center=panel.point(a,b,0.028);
+  const ring=[];
+  for(let k=0;k<=FIX_AREA_SEG;k++){
+    const ph=k/FIX_AREA_SEG*Math.PI*2;
+    const [aa,bb]=panel.step(a,b,rad*Math.cos(ph),rad*Math.sin(ph));
+    const A=Math.min(panel.aMax+0.10,Math.max(panel.aMin-0.10,aa));
+    const B=panel.bWrap?bb:Math.min(1.02,Math.max(-0.02,bb));
+    ring.push(panel.point(A,B,0.028));
+  }
+  const arr=fixArea.geometry.attributes.position.array;
+  let i=0;
+  for(let k=0;k<FIX_AREA_SEG;k++){
+    const p1=ring[k], p2=ring[k+1];
+    arr[i++]=center.x; arr[i++]=center.y; arr[i++]=center.z;
+    arr[i++]=p1.x; arr[i++]=p1.y; arr[i++]=p1.z;
+    arr[i++]=p2.x; arr[i++]=p2.y; arr[i++]=p2.z;
+  }
+  fixArea.geometry.attributes.position.needsUpdate=true;
+  fixArea.visible=true;
+}
+
 function marker(color,size,ring){
   const g=new THREE.Group();
   const mat=new THREE.LineBasicMaterial({color});
@@ -792,8 +1163,27 @@ function marker(color,size,ring){
   }
   g.visible=false; air.add(g); return g;
 }
-const srcMark=marker(0xFF3B5C,0.34,true);
-const fixMark=marker(0xE8C34E,0.26,false);
+const srcMark=marker(0xFF3B5C,0.46,true);   // impact — where the tap actually happened
+const fixMark=marker(0xE8C34E,0.30,false);  // fix — the array's solved estimate
+
+// --- hardware-span marker: the 2 user-picked nodes standing in for
+// wherever the physical mic array actually sits on the airframe
+const HW_SPAN_SEG=6;
+const hwSpanLine=new THREE.Line(
+  new THREE.BufferGeometry().setAttribute("position",new THREE.Float32BufferAttribute(new Float32Array((HW_SPAN_SEG+1)*3),3)),
+  new THREE.LineBasicMaterial({color:0xFFFFFF}));
+hwSpanLine.visible=false; air.add(hwSpanLine);
+function drawHwSpanLine(){
+  if(!hwSpan){ hwSpanLine.visible=false; return; }
+  const n1=nodes[hwSpan.n1], n2=nodes[hwSpan.n2];
+  const arr=hwSpanLine.geometry.attributes.position.array;
+  for(let s=0;s<=HW_SPAN_SEG;s++){
+    const p=lerpOnPanel(n1,n2,s/HW_SPAN_SEG,0.05);
+    arr[s*3]=p.x; arr[s*3+1]=p.y; arr[s*3+2]=p.z;
+  }
+  hwSpanLine.geometry.attributes.position.needsUpdate=true;
+  hwSpanLine.visible=true;
+}
 
 /* --- camera control ---------------------------------------------- */
 let camT=-0.75, camP=1.16, camD=27;
@@ -808,8 +1198,12 @@ function applyCam(){
 }
 let dragging=false,px=0,py=0;
 const gl=renderer.domElement;
-gl.addEventListener("pointerdown",e=>{dragging=true;px=e.clientX;py=e.clientY;gl.setPointerCapture(e.pointerId);});
-gl.addEventListener("pointerup",e=>{dragging=false;});
+let downX=0, downY=0;
+gl.addEventListener("pointerdown",e=>{dragging=true;px=e.clientX;py=e.clientY;downX=e.clientX;downY=e.clientY;gl.setPointerCapture(e.pointerId);});
+gl.addEventListener("pointerup",e=>{
+  dragging=false;
+  if(pickMode && Math.hypot(e.clientX-downX,e.clientY-downY)<6) tryPickNode(e);
+});
 gl.addEventListener("pointermove",e=>{
   if(dragging){
     tgtT = camT -= (e.clientX-px)*0.008;
@@ -864,15 +1258,23 @@ resize(); applyCam();
    6. EVENT SIMULATION
    =================================================================== */
 let lastHitMap={}, current=null, events=[], evCount=0;
+let hwSpan=null, pickMode=false, pickStage=0, pickFirst=-1;
 let anim=null, autoTimer=null;
 
-function makeEvent(){
+function makeEvent(forced){
   const seed=(Math.random()*1e9)|0, rnd=mulberry(seed);
   const roll=rnd();
-  const panel = roll<0.60 ? PANELS.barrel : (roll<0.80 ? PANELS.wingR : PANELS.wingL);
-  const a = panel.aMin + rnd()*(panel.aMax-panel.aMin);
-  const b = panel.bWrap ? wrapPi(rnd()*2*Math.PI-Math.PI)
-                        : panel.bMin + rnd()*(panel.bMax-panel.bMin);
+  let panel, a, b;
+  if(forced){
+    panel = forced.panel;
+    a = Math.min(panel.aMax, Math.max(panel.aMin, forced.a));
+    b = panel.bWrap ? wrapPi(forced.b) : Math.min(panel.bMax, Math.max(panel.bMin, forced.b));
+  } else {
+    panel = roll<0.60 ? PANELS.barrel : (roll<0.80 ? PANELS.wingR : PANELS.wingL);
+    a = panel.aMin + rnd()*(panel.aMax-panel.aMin);
+    b = panel.bWrap ? wrapPi(rnd()*2*Math.PI-Math.PI)
+                    : panel.bMin + rnd()*(panel.bMax-panel.bMin);
+  }
   const fPeak = [38,105,195,300][Math.floor(rnd()*4)] + (rnd()-0.5)*36;
   const A0 = 84 + rnd()*18;
 
@@ -998,6 +1400,7 @@ function present(ev){
   $("hState").className="v hot";
   drawRuler();
   renderLog();
+  drawFixArea(ev.panel, ev.fix.a, ev.fix.b, (ev.fix.rms*waveV*1.96)/MPU);
   runAnimation(ev,triNodes);
 }
 
@@ -1010,6 +1413,14 @@ function paintNodes(ev,triNodes){
     m.material.color.setHex(col); m.scale.setScalar(sc);
   });
   if(triNodes.length===3) triNodes.forEach((n,k)=>nodeMeshes[n].material.color.set(TRI_COL[k]));
+  paintHwSpan();
+}
+function paintHwSpan(){
+  if(!hwSpan) return;
+  [hwSpan.n1,hwSpan.n2].forEach(idx=>{
+    nodeMeshes[idx].material.color.setHex(0xFFFFFF);
+    nodeMeshes[idx].scale.setScalar(1.6);
+  });
 }
 function paintCell(ev,triNodes){
   if(triNodes.length!==3){cellFill.visible=false;cellEdge.visible=false;return;}
@@ -1220,6 +1631,89 @@ function inject(){
   present(ev); renderZones();
 }
 $("btnInject").addEventListener("click",inject);
+
+/* --- hardware span: click two nodes to say "this is what the 2-mic
+   sheet is listening to" so real taps land on that segment ---------- */
+function updateSpanLabel(){
+  const el=$("spanV");
+  if(!el) return;
+  if(hwSpan) el.textContent=nodes[hwSpan.n1].id+" ↔ "+nodes[hwSpan.n2].id;
+  else if(pickMode && pickStage===1) el.textContent="click the second node…";
+  else if(pickMode) el.textContent="click the first node…";
+  else el.textContent="not set — click two nodes";
+}
+function tryPickNode(e){
+  const r=gl.getBoundingClientRect();
+  mouse.x=((e.clientX-r.left)/r.width)*2-1;
+  mouse.y=-((e.clientY-r.top)/r.height)*2+1;
+  ray.setFromCamera(mouse,camera);
+  const hit=ray.intersectObjects(nodeMeshes,false)[0];
+  if(!hit) return;
+  const idx=hit.object.userData.n.i;
+  if(pickStage===0){
+    pickFirst=idx; pickStage=1; updateSpanLabel();
+    return;
+  }
+  if(idx===pickFirst) return; // same node twice — keep waiting
+  if(nodes[idx].panel!==nodes[pickFirst].panel){
+    $("phase").textContent="Second node must be on the same panel — try again";
+    $("phase").classList.add("on");
+    setTimeout(()=>$("phase").classList.remove("on"),1800);
+    return;
+  }
+  hwSpan={n1:pickFirst,n2:idx};
+  pickMode=false; pickStage=0;
+  $("btnPickSpan").setAttribute("aria-pressed","false");
+  drawHwSpanLine(); updateSpanLabel();
+  if(!current) renderZones();
+}
+$("btnPickSpan").addEventListener("click",e=>{
+  pickMode=e.currentTarget.getAttribute("aria-pressed")!=="true";
+  e.currentTarget.setAttribute("aria-pressed",pickMode);
+  pickStage=0; pickFirst=-1;
+  updateSpanLabel();
+});
+
+function tapToSource(nx,ny){
+  const u=Math.min(1,Math.max(0,nx));
+  if(hwSpan){
+    const n1=nodes[hwSpan.n1], n2=nodes[hwSpan.n2], panel=n1.panel;
+    const a=n1.a+(n2.a-n1.a)*u;
+    const b=panel.bWrap ? n1.b+wrapPi(n2.b-n1.b)*u : n1.b+(n2.b-n1.b)*u;
+    return {panel,a,b};
+  }
+  // no span picked yet — fall back to a barrel-wide spread so a live tap
+  // still lands somewhere sensible instead of silently doing nothing.
+  const panel=PANELS.barrel;
+  const a=panel.aMin+u*(panel.aMax-panel.aMin);
+  const b=wrapPi((Math.min(1,Math.max(0,ny))-0.5)*Math.PI);
+  return {panel,a,b};
+}
+function liveInject(panel,a,b){
+  let ev=null,guard=0;
+  while(!ev && guard++<12) ev=makeEvent({panel,a,b});
+  if(!ev) return; // real tap too quiet to trip the threshold — ignore
+  events.push(ev); if(events.length>24) events.shift();
+  present(ev); renderZones();
+}
+const feedEl=document.getElementById("hFeed");
+function setFeed(text,ok){ if(!feedEl) return; feedEl.textContent=text; feedEl.className="v "+(ok?"ok":"hot"); }
+(function connectFeed(){
+  let es;
+  try{ es=new EventSource("/stream"); } catch(err){ setFeed("● OFFLINE",false); return; }
+  es.addEventListener("status", e=>{
+    const d=JSON.parse(e.data);
+    if(d.live) setFeed("● LIVE SERIAL",true);
+    else if(d.autoplay) setFeed("● MOCK (AUTO)",false);
+    else setFeed("● NO FEED — use test button",false);
+  });
+  es.addEventListener("tap", e=>{
+    const d=JSON.parse(e.data);
+    const {panel,a,b}=tapToSource(d.nx,d.ny);
+    liveInject(panel,a,b);
+  });
+  es.onerror=()=>setFeed("● NO CONNECTION",false);
+})();
 $("btnReplay").addEventListener("click",()=>{ if(current) present(current); });
 $("btnFill").addEventListener("click",e=>{
   const on=e.currentTarget.getAttribute("aria-pressed")!=="true";
@@ -1259,6 +1753,9 @@ let t=0;
       m.material.color.setHex(k>0.6?C.nodeArm:C.node);
       m.scale.setScalar(1+k*0.35);
     });
+    paintHwSpan();
+  } else if(srcMark.visible){
+    srcMark.scale.setScalar(1+0.18*Math.sin(t*4.2));
   }
   renderer.render(scene,camera);
 })();
@@ -1269,3 +1766,47 @@ setTimeout(()=>{ drawRuler(); resize(); },120);
 </script>
 </body>
 </html>
+
+"""
+
+
+# ═══════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    ser = None
+    if USE_REAL_HARDWARE:
+        print("Connecting to Arduino...")
+        try:
+            ser = connect_arduino()
+            _live_state["live"] = True
+            print("Connected. Streaming live taps to the console...")
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            print("No Arduino connected.")
+
+    if ser is None and MOCK_AUTOPLAY:
+        print("MOCK_AUTOPLAY is on — MockSerial will cycle canned tap positions.")
+        ser = MockSerial()
+        _live_state["autoplay"] = True
+
+    if ser is not None:
+        start_serial(ser)
+    else:
+        print('No live feed running. Use "Trigger test event" in the console '
+              "to exercise it, or flip USE_REAL_HARDWARE / MOCK_AUTOPLAY above.")
+
+    # Keep watching for the Arduino even if we started on mock/idle — plugging
+    # it in later is enough to take over the live feed, no restart needed.
+    threading.Thread(target=hardware_watch_loop, daemon=True).start()
+
+    server = http.server.ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    url = f"http://{HTTP_HOST}:{HTTP_PORT}/"
+    print(f"Serving Airframe AE Array console at {url}")
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down.")
+        server.shutdown()
